@@ -1,0 +1,146 @@
+================================================================================
+Git Bash & cURL Commands Guide: End-to-End System Verification
+================================================================================
+
+--------------------------------------------------------------------------------
+STEP 1: Start All Services via Docker Compose
+--------------------------------------------------------------------------------
+# Build and start all 4 services in the background (API, Celery Worker, PostgreSQL, Redis)
+docker compose up --build -d
+
+# Verify all containers are running and healthy
+docker compose ps
+
+
+--------------------------------------------------------------------------------
+STEP 2: Verify Service Health Check
+--------------------------------------------------------------------------------
+curl -s -X GET http://localhost:8000/health
+
+# Expected Response:
+# {"status":"healthy","database":"connected","redis":"connected"}
+
+
+--------------------------------------------------------------------------------
+STEP 3: Full Multi-Agent & Human-in-the-Loop (HITL) Workflow
+--------------------------------------------------------------------------------
+
+# 3A. Create a New Collaborative Agent Task
+RESPONSE=$(curl -s -X POST http://localhost:8000/api/v1/tasks \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "Research the key features of LangGraph and CrewAI. Write a short comparison summary for a technical audience."}')
+
+echo "Create Task Response: $RESPONSE"
+
+# Extract task_id into a variable (or copy the UUID from the output manually)
+TASK_ID=$(echo "$RESPONSE" | grep -o '"task_id":"[^"]*' | cut -d'"' -f4)
+echo "Active Task ID: $TASK_ID"
+
+# Expected Response (HTTP 202 in <500ms):
+# {"task_id":"...","status":"PENDING"}
+
+
+# 3B. Check Task Status While Paused for Human Approval
+# Wait 2-3 seconds for ResearchAgent and WritingAgent to complete Phase 1
+sleep 2
+curl -s -X GET http://localhost:8000/api/v1/tasks/$TASK_ID
+
+# Expected Response:
+# status will be "AWAITING_APPROVAL", result contains draft summary, agent_logs contains 2 entries.
+
+
+# 3C. Inspect the Redis Ephemeral Scratchpad Workspace
+docker exec -it langgraph_redis redis-cli get "task:$TASK_ID:workspace"
+
+# Expected Response:
+# JSON containing raw research findings stored by ResearchAgent under task:<task_id>:workspace
+
+
+# 3D. Provide Human Approval
+curl -s -X POST http://localhost:8000/api/v1/tasks/$TASK_ID/approve \
+  -H "Content-Type: application/json" \
+  -d '{
+    "approved": true,
+    "feedback": "Looks great! Include deployment recommendations."
+  }'
+
+# Expected Response (HTTP 200):
+# {"task_id":"...","status":"RESUMED"}
+
+
+# 3E. Retrieve Final Completed Task
+sleep 2
+curl -s -X GET http://localhost:8000/api/v1/tasks/$TASK_ID
+
+# Expected Response:
+# status will be "COMPLETED", result contains final summary with feedback incorporated.
+
+
+--------------------------------------------------------------------------------
+STEP 4: Verify Fault Tolerance & Flaky Tool Auto-Retry
+--------------------------------------------------------------------------------
+# Submit a task with '__FLAKY_TEST__' to trigger transient network simulation
+FLAKY_RES=$(curl -s -X POST http://localhost:8000/api/v1/tasks \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "__FLAKY_TEST__"}')
+
+FLAKY_ID=$(echo "$FLAKY_RES" | grep -o '"task_id":"[^"]*' | cut -d'"' -f4)
+echo "Flaky Task ID: $FLAKY_ID"
+
+# Wait 2 seconds and inspect structured JSON activity log
+sleep 2
+tail -n 10 logs/agent_activity.log
+
+# Expected Log Entries in logs/agent_activity.log:
+# 1. Action details: "Tool execution failed on attempt 1: Simulated transient network timeout.. Retrying..."
+# 2. Action details: "Tool execution succeeded on retry attempt 2."
+
+
+--------------------------------------------------------------------------------
+STEP 5: Test Real-Time WebSocket Streaming
+--------------------------------------------------------------------------------
+python3 -c "
+import asyncio, json, httpx, websockets
+
+async def stream_task():
+    async with httpx.AsyncClient() as client:
+        # Create task
+        res = await client.post('http://localhost:8000/api/v1/tasks', json={'prompt': 'WebSocket live test'})
+        task_id = res.json()['task_id']
+        print(f'Listening to WebSocket for Task ID: {task_id}')
+
+        # Connect to WebSocket
+        async with websockets.connect(f'ws://localhost:8000/ws/tasks/{task_id}') as ws:
+            while True:
+                msg = await ws.recv()
+                data = json.loads(msg)
+                print(f'-> Live Status Update: {data[\"status\"]}')
+                
+                if data.get('status') == 'AWAITING_APPROVAL':
+                    print('Sending approval...')
+                    await client.post(f'http://localhost:8000/api/v1/tasks/{task_id}/approve', json={'approved': True})
+                
+                if data.get('status') in ['COMPLETED', 'FAILED']:
+                    break
+
+asyncio.run(stream_task())
+"
+
+# Expected Output Stream:
+# -> Live Status Update: PENDING
+# -> Live Status Update: RUNNING
+# -> Live Status Update: AWAITING_APPROVAL
+# Sending approval...
+# -> Live Status Update: RESUMED
+# -> Live Status Update: RUNNING
+# -> Live Status Update: COMPLETED
+
+
+--------------------------------------------------------------------------------
+STEP 6: Run Full Automated Test Suite
+--------------------------------------------------------------------------------
+.venv/bin/pytest -v tests/
+
+# Expected Output:
+# 12 passed in <1s
+================================================================================
