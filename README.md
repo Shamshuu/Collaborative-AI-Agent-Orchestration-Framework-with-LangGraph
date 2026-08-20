@@ -127,7 +127,7 @@ flowchart TD
 ### 1. Clone & Configure Environment
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/Shamshuu/Collaborative-AI-Agent-Orchestration-Framework-with-LangGraph
 cd Collaborative-AI-Agent-Orchestration-Framework-with-LangGraph
 
 # Create .env from template
@@ -276,6 +276,3 @@ pytest -v tests/
 ```
 
 ---
-
-## 📝 License
-MIT License. Open-source and production ready.
