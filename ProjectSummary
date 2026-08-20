@@ -1,0 +1,131 @@
+================================================================================
+Collaborative Multi-Agent Orchestration Framework with LangGraph
+================================================================================
+
+1. PROJECT OVERVIEW & CORE PURPOSE
+--------------------------------------------------------------------------------
+This project is an asynchronous, collaborative multi-agent backend system designed 
+to orchestrate multiple specialized AI agents working together to solve complex, 
+multi-step tasks.
+
+In real-world production environments, sending large complex prompts directly to a 
+single LLM synchronously causes significant challenges:
+- High Latency & HTTP Timeouts: Synchronous LLM calls freeze web server workers.
+- Lack of Human Oversight: High-stakes operations need human approval before executing.
+- State Overhead: Storing high-frequency intermediate scratchpad data in SQL databases 
+  leads to disk I/O bottlenecks and database bloat.
+- Network Instability: Real-world APIs and external tools experience transient network drops.
+
+This project solves these challenges by combining FastAPI, LangGraph, Celery, Redis, 
+and PostgreSQL into a cohesive, containerized architecture.
+
+
+2. SYSTEM ARCHITECTURE & AGENT WORKFLOW
+--------------------------------------------------------------------------------
+                  [Client / UI / WebSocket Consumer]
+                              |           ^
+            1. POST /api/v1/tasks         | Live Status Stream
+                              v           | (WebSocket: /ws/tasks/:id)
+                      [FastAPI Gateway] --+
+                       /             \
+       Saves PENDING /                 \ Dispatches Asynchronous Task
+                    v                   v
+          [(PostgreSQL DB)]        [(Redis Broker db:1)]
+                                        |
+                                        v
+                            [Celery Background Worker]
+                            +-------------------------------------------+
+                            | LangGraph StateGraph Engine               |
+                            |                                           |
+                            | [Phase 1: Research & Drafting]            |
+                            | 1. ResearchAgent Node                     |
+                            |    - Executes search tool with retry loop |
+                            |    - Writes findings to Redis scratchpad  |
+                            |      (Key: task:<task_id>:workspace)      |
+                            |                                           |
+                            | 2. WritingAgent Node                      |
+                            |    - Reads findings from Redis scratchpad |
+                            |    - Synthesizes technical summary draft  |
+                            |                                           |
+                            | 3. Pause Gate (Human-in-the-Loop)         |
+                            |    - Saves draft & logs to PostgreSQL     |
+                            |    - Sets status to AWAITING_APPROVAL     |
+                            |    - Publishes status update to Redis     |
+                            |                                           |
+                            | [Phase 2: Human Approval & Completion]    |
+                            | 4. User calls POST /approve with feedback |
+                            | 5. Worker resumes from saved checkpoint   |
+                            | 6. Finalizes summary with human notes     |
+                            | 7. Sets status to COMPLETED in PostgreSQL |
+                            +-------------------------------------------+
+
+
+3. HOW EACH FUNCTIONALITY IS IMPLEMENTED
+--------------------------------------------------------------------------------
+A. Asynchronous Task Creation (FastAPI + Celery)
+   - Client sends POST /api/v1/tasks with a prompt.
+   - FastAPI generates a UUID, inserts a record into PostgreSQL with status 'PENDING', 
+     queues the background Celery task (run_agent_workflow.delay), and immediately 
+     returns HTTP 202 Accepted in under 500ms.
+
+B. Ephemeral Agent Scratchpad Memory (Redis)
+   - When ResearchAgent gathers data, storing large raw outputs in SQL would cause bloat.
+   - Instead, ResearchAgent writes findings to Redis key 'task:<task_id>:workspace'.
+   - WritingAgent reads directly from this Redis key to build its prompt context.
+
+C. Human-in-the-Loop (HITL) Workflow (LangGraph + PostgreSQL)
+   - After the WritingAgent generates the draft comparison summary, the worker updates 
+     the database status to 'AWAITING_APPROVAL' and pauses execution.
+   - The user inspects the draft via GET /api/v1/tasks/{task_id}.
+   - The user calls POST /api/v1/tasks/{task_id}/approve with feedback.
+   - The API updates status to 'RESUMED' and triggers resume_agent_workflow in Celery, 
+     which incorporates feedback, finalizes the result, and sets status to 'COMPLETED'.
+
+D. Real-Time Status Streaming (WebSockets + Redis Pub/Sub)
+   - Endpoint: /ws/tasks/{task_id}
+   - When a client connects, FastAPI returns the current task status immediately.
+   - Background Celery workers publish status transitions (RUNNING, AWAITING_APPROVAL, 
+     RESUMED, COMPLETED) to Redis Pub/Sub channel 'task_updates:{task_id}'.
+   - FastAPI WebSocket subscriber forwards these events in real-time as JSON messages.
+
+E. Fault Tolerance & Automatic Retry Mechanism
+   - A simulated tool introduces a transient network timeout on '__FLAKY_TEST__'.
+   - The ResearchAgent catches the exception, writes a structured failure log, waits 
+     briefly, automatically retries the action, logs the retry success, and recovers 
+     cleanly without failing the overall workflow.
+
+F. Structured JSON Activity Logging
+   - All agent actions, tool calls, retries, and state transitions are written to 
+     'logs/agent_activity.log' as independent, machine-readable JSON objects:
+     {"timestamp": "...", "task_id": "...", "agent_name": "...", "action_details": "..."}
+
+
+4. HOW EACH TECHNOLOGY CONTRIBUTES TO THE SYSTEM
+--------------------------------------------------------------------------------
+- FastAPI:
+  High-performance asynchronous HTTP gateway and WebSocket server with automatic 
+  Pydantic schema validation.
+
+- LangGraph:
+  Stateful multi-agent orchestration framework that models agent workflows as 
+  directed graphs (StateGraph) with custom nodes, shared state, and control flow gates.
+
+- Celery:
+  Distributed background task queue that prevents LLM execution and web searches 
+  from blocking API web worker threads.
+
+- Redis:
+  Multi-purpose high-speed memory layer serving 3 critical functions:
+  1. Celery Message Broker & Result Backend (db 1 & db 2).
+  2. Ephemeral Agent Scratchpad Workspace (db 0, key: task:<task_id>:workspace).
+  3. Pub/Sub Message Bus for streaming status changes to WebSockets.
+
+- PostgreSQL:
+  Persistent relational database storing permanent task status records, final results, 
+  timestamps, and JSONB audit trails (agent_logs).
+
+- Docker & Docker Compose:
+  Multi-container orchestration packaging the API, Worker, Database, and Redis with 
+  startup health checks (pg_isready, redis-cli ping, curl /health) ensuring reliable, 
+  one-command deployments (docker compose up --build).
+================================================================================
